@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  models: read
 
 jobs:
   digest:
@@ -36,6 +37,7 @@ jobs:
         run: python biotech_digest.py
         env:
           TZ: Asia/Seoul
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Commit and push digest
         run: |

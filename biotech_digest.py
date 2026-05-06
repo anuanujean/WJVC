@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""
-Biotech VC Daily Digest
-========================
-Pulls latest news from major biotech/pharma RSS feeds, classifies each entry
-by deal type AND therapeutic modality, and outputs a structured markdown digest.
-
-Usage:
-    python biotech_digest.py              # last 24 hours
-    python biotech_digest.py --hours 48   # last 48 hours
-"""
+"""Biotech VC Daily Digest — bilingual (EN/KO) with LLM-rewritten summaries."""
 
 import argparse
+import json
+import os
 import re
-from datetime import datetime, timezone, timedelta
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import feedparser
@@ -30,13 +25,10 @@ FEEDS = {
     "FierceBiotech Research": "https://www.fiercebiotech.com/biotech-research/rss/xml",
 }
 
-# Optional. Companies you're actively tracking — appear at top if any hits.
 WATCHLIST = {
     # "Moderna": ["moderna", "mrna"],
-    # "Vertex":  ["vertex pharm", "vrtx"],
 }
 
-# Deal type classification (regex, case-insensitive)
 DEAL_PATTERNS = {
     "💰 Financing": [
         r"\bseries [a-z]\b", r"\braises? \$", r"\bsecures? \$",
@@ -68,7 +60,6 @@ DEAL_PATTERNS = {
     ],
 }
 
-# Therapeutic modality / area classification
 MODALITY_PATTERNS = {
     "🎯 Oncology":           [r"\bcancer\b", r"\boncolog\w+", r"\btumor\b", r"\bleukemia\b",
                               r"\blymphoma\b", r"\bmelanoma\b", r"\bcarcinoma\b", r"\bsolid tumor\b"],
@@ -93,13 +84,21 @@ MODALITY_PATTERNS = {
 DEAL_ORDER = list(DEAL_PATTERNS.keys()) + ["📰 General"]
 MODALITY_ORDER = list(MODALITY_PATTERNS.keys()) + ["🔬 Other"]
 
+# GitHub Models — free, OpenAI-compatible, auth via GITHUB_TOKEN in Actions
+LLM_ENDPOINT = "https://models.github.ai/inference/chat/completions"
+LLM_MODEL = "openai/gpt-4o-mini"
+LLM_BATCH_SIZE = 6
+LLM_TIMEOUT_S = 120
 
-# ─── CORE LOGIC ──────────────────────────────────────────────────────────────
 
-def clean_summary(raw: str, max_len: int = 350) -> str:
-    text = re.sub(r"<[^>]+>", "", raw)
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+def clean_text(raw: str, max_len: int = 1200) -> str:
+    text = re.sub(r"<[^>]+>", "", raw or "")
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:max_len] + "..." if len(text) > max_len else text
+    if max_len and len(text) > max_len:
+        text = text[:max_len].rstrip() + "..."
+    return text
 
 
 def classify(text: str, patterns: dict, default: str) -> list[str]:
@@ -117,6 +116,8 @@ def watchlist_hits(text: str) -> list[str]:
             if any(a.lower() in text for a in aliases)]
 
 
+# ─── FETCH ───────────────────────────────────────────────────────────────────
+
 def fetch_feed(name: str, url: str, since: datetime) -> list[dict]:
     feed = feedparser.parse(url)
     out = []
@@ -129,14 +130,16 @@ def fetch_feed(name: str, url: str, since: datetime) -> list[dict]:
             continue
 
         title = e.get("title", "").strip()
-        summary = clean_summary(e.get("summary", ""))
-        full_text = title + " " + summary
+        summary_raw = clean_text(e.get("summary", ""))
+        full_text = title + " " + summary_raw
 
         out.append({
             "source": name,
             "title": title,
             "link": e.get("link", ""),
-            "summary": summary,
+            "summary_raw": summary_raw,
+            "summary_en": "",
+            "summary_ko": "",
             "published": pub_dt,
             "deals": classify(full_text, DEAL_PATTERNS, "📰 General"),
             "modalities": classify(full_text, MODALITY_PATTERNS, "🔬 Other"),
@@ -145,82 +148,184 @@ def fetch_feed(name: str, url: str, since: datetime) -> list[dict]:
     return out
 
 
-def build_summary_table(entries: list[dict]) -> str:
-    """Modality × Deal Type matrix at the top of the digest."""
-    counts: dict[str, dict[str, int]] = {}
-    for e in entries:
-        for m in e["modalities"]:
-            counts.setdefault(m, {})
-            for d in e["deals"]:
-                counts[m][d] = counts[m].get(d, 0) + 1
-
-    if not counts:
-        return ""
-
-    deal_cols = [d for d in DEAL_ORDER if any(d in row for row in counts.values())]
-    header = "| Modality | Total | " + " | ".join(deal_cols) + " |"
-    sep = "|" + "---|" * (len(deal_cols) + 2)
-
-    rows = []
-    for m in MODALITY_ORDER:
-        if m not in counts:
-            continue
-        row_counts = counts[m]
-        total = sum(row_counts.values())
-        cells = [str(row_counts.get(d, 0)) if row_counts.get(d, 0) else "·" for d in deal_cols]
-        rows.append(f"| {m} | **{total}** | " + " | ".join(cells) + " |")
-
-    return "\n".join(["## 📊 At a Glance", "", header, sep, *rows, ""])
-
-
-def generate_digest(hours: int = 24) -> str:
+def collect_entries(hours: int) -> list[dict]:
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     print(f"Fetching feeds since {since.strftime('%Y-%m-%d %H:%M UTC')}...\n")
-
-    entries = []
+    entries: list[dict] = []
     for name, url in FEEDS.items():
         try:
             new = fetch_feed(name, url, since)
             print(f"  ✓ {name:30s} {len(new):3d}")
             entries.extend(new)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             print(f"  ✗ {name:30s} ERROR: {exc}")
-
     entries.sort(key=lambda x: x["published"], reverse=True)
-
-    # Dedupe by title
     seen, unique = set(), []
     for e in entries:
         key = e["title"].lower().strip()
         if key and key not in seen:
             seen.add(key)
             unique.append(e)
+    return unique
 
+
+# ─── LLM ENRICHMENT ──────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = (
+    "You are a biotech VC news editor. For each news item, produce two summaries:\n"
+    "- 'en': 2-3 informative sentences in English. Mention concrete facts: company "
+    "name, deal value (if any), drug/target/modality, trial phase, indication, key "
+    "numbers. No fluff or marketing language. Do not just restate the title.\n"
+    "- 'ko': natural Korean translation of the same content. Use industry terminology "
+    "(e.g., 임상 2상, FDA 승인, 시리즈 B). Keep company and drug names in English.\n"
+    'Return strictly valid JSON: {"items":[{"i":1,"en":"...","ko":"..."}, ...]}.'
+)
+
+
+def call_llm(messages: list[dict]) -> str | None:
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return None
+    body = json.dumps({
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        LLM_ENDPOINT,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        print(f"  ✗ LLM HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:300]}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  ✗ LLM error: {e}")
+    return None
+
+
+def enrich_batch(entries: list[dict]) -> bool:
+    items_text = "\n\n".join(
+        f"{i+1}. TITLE: {e['title']}\n   CONTENT: {e['summary_raw']}"
+        for i, e in enumerate(entries)
+    )
+    raw = call_llm([
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Items:\n{items_text}"},
+    ])
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as ex:
+        print(f"  ✗ JSON parse failed: {ex}")
+        return False
+    for item in parsed.get("items", []):
+        idx = item.get("i", 0) - 1
+        if 0 <= idx < len(entries):
+            entries[idx]["summary_en"] = item.get("en", "").strip()
+            entries[idx]["summary_ko"] = item.get("ko", "").strip()
+    return True
+
+
+def enrich_with_llm(entries: list[dict]) -> None:
+    if not entries:
+        return
+    if not os.environ.get("GITHUB_TOKEN"):
+        print("\n  (no GITHUB_TOKEN — skipping LLM, using raw RSS summaries)")
+        return
+    print(f"\nEnriching {len(entries)} entries via GitHub Models ({LLM_MODEL})...")
+    for start in range(0, len(entries), LLM_BATCH_SIZE):
+        batch = entries[start:start + LLM_BATCH_SIZE]
+        ok = enrich_batch(batch)
+        n = start // LLM_BATCH_SIZE + 1
+        print(f"  {'✓' if ok else '✗'} batch {n} ({len(batch)} items)")
+
+
+# ─── RENDERING ───────────────────────────────────────────────────────────────
+
+LABELS = {
+    "en": {
+        "title_prefix": "🧬 Biotech Daily Digest",
+        "meta": lambda h, n, s: f"*Last {h}h · {n} unique entries · {s} sources*",
+        "at_a_glance": "📊 At a Glance",
+        "modality_col": "Modality",
+        "total_col": "Total",
+        "watchlist": "🎯 Watchlist Hits",
+    },
+    "ko": {
+        "title_prefix": "🧬 바이오테크 데일리 다이제스트",
+        "meta": lambda h, n, s: f"*최근 {h}시간 · 고유 기사 {n}건 · 소스 {s}개*",
+        "at_a_glance": "📊 한눈에 보기",
+        "modality_col": "모달리티",
+        "total_col": "합계",
+        "watchlist": "🎯 워치리스트 매치",
+    },
+}
+
+
+def build_summary_table(entries: list[dict], lang: str) -> str:
+    L = LABELS[lang]
+    counts: dict[str, dict[str, int]] = {}
+    for e in entries:
+        for m in e["modalities"]:
+            counts.setdefault(m, {})
+            for d in e["deals"]:
+                counts[m][d] = counts[m].get(d, 0) + 1
+    if not counts:
+        return ""
+    deal_cols = [d for d in DEAL_ORDER if any(d in row for row in counts.values())]
+    header = f"| {L['modality_col']} | {L['total_col']} | " + " | ".join(deal_cols) + " |"
+    sep = "|" + "---|" * (len(deal_cols) + 2)
+    rows = []
+    for m in MODALITY_ORDER:
+        if m not in counts:
+            continue
+        row = counts[m]
+        total = sum(row.values())
+        cells = [str(row.get(d, 0)) if row.get(d, 0) else "·" for d in deal_cols]
+        rows.append(f"| {m} | **{total}** | " + " | ".join(cells) + " |")
+    return "\n".join([f"## {L['at_a_glance']}", "", header, sep, *rows, ""])
+
+
+def render_digest(entries: list[dict], lang: str, hours: int) -> str:
+    L = LABELS[lang]
     today = datetime.now().strftime("%Y-%m-%d (%A)")
+    sum_field = "summary_en" if lang == "en" else "summary_ko"
+
+    def get_summary(e: dict) -> str:
+        return e.get(sum_field) or e.get("summary_raw") or ""
+
     lines = [
-        f"# 🧬 Biotech Daily Digest — {today}",
+        f"# {L['title_prefix']} — {today}",
         "",
-        f"*Last {hours}h · {len(unique)} unique entries · {len(FEEDS)} sources*",
+        L["meta"](hours, len(entries), len(FEEDS)),
         "",
-        build_summary_table(unique),
+        build_summary_table(entries, lang),
     ]
 
-    # Watchlist hits
-    wl = [e for e in unique if e["watchlist"]]
+    wl = [e for e in entries if e["watchlist"]]
     if wl:
-        lines += ["## 🎯 Watchlist Hits", ""]
+        lines += [f"## {L['watchlist']}", ""]
         for e in wl:
             tags = ", ".join(f"**{c}**" for c in e["watchlist"])
             deal_tags = " ".join(f"`{d}`" for d in e["deals"])
             lines += [
                 f"- {tags} {deal_tags} — [{e['title']}]({e['link']}) *— {e['source']}*",
-                f"  > {e['summary']}",
+                f"  > {get_summary(e)}",
                 "",
             ]
 
-    # Group by modality (primary view)
     by_mod: dict[str, list[dict]] = {}
-    for e in unique:
+    for e in entries:
         for m in e["modalities"]:
             by_mod.setdefault(m, []).append(e)
 
@@ -233,25 +338,30 @@ def generate_digest(hours: int = 24) -> str:
             deal_tags = " ".join(f"`{d}`" for d in e["deals"])
             lines += [
                 f"- {deal_tags} [{e['title']}]({e['link']}) *— {e['source']}*",
-                f"  {e['summary']}",
+                f"  {get_summary(e)}",
                 "",
             ]
-
     return "\n".join(lines)
 
 
-def main():
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--out", type=Path, default=Path("digests"))
     args = parser.parse_args()
 
-    digest = generate_digest(hours=args.hours)
+    entries = collect_entries(args.hours)
+    enrich_with_llm(entries)
+
     args.out.mkdir(exist_ok=True)
     today_str = datetime.now().strftime("%Y%m%d")
-    out_path = args.out / f"digest_{today_str}.md"
-    out_path.write_text(digest, encoding="utf-8")
-    print(f"\n✓ Digest saved → {out_path} ({len(digest):,} chars)")
+    for lang in ("en", "ko"):
+        digest = render_digest(entries, lang, args.hours)
+        out_path = args.out / f"digest_{today_str}_{lang}.md"
+        out_path.write_text(digest, encoding="utf-8")
+        print(f"\n✓ {lang.upper()} digest → {out_path} ({len(digest):,} chars)")
 
 
 if __name__ == "__main__":
