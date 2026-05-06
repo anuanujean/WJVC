@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Biotech VC Daily Digest — bilingual (EN/KO) with LLM-rewritten summaries."""
+"""Biotech VC Daily Digest — bilingual (EN/KO) with structured LLM summaries."""
 
 import argparse
 import json
@@ -25,7 +25,7 @@ FEEDS = {
     "FierceBiotech Research": "https://www.fiercebiotech.com/biotech-research/rss/xml",
 }
 
-WATCHLIST = {
+WATCHLIST: dict[str, list[str]] = {
     # "Moderna": ["moderna", "mrna"],
 }
 
@@ -84,21 +84,26 @@ MODALITY_PATTERNS = {
 DEAL_ORDER = list(DEAL_PATTERNS.keys()) + ["📰 General"]
 MODALITY_ORDER = list(MODALITY_PATTERNS.keys()) + ["🔬 Other"]
 
-# GitHub Models — free, OpenAI-compatible, auth via GITHUB_TOKEN in Actions
 LLM_ENDPOINT = "https://models.github.ai/inference/chat/completions"
 LLM_MODEL = "openai/gpt-4o-mini"
-LLM_BATCH_SIZE = 6
-LLM_TIMEOUT_S = 120
+LLM_BATCH_SIZE = 4
+LLM_TIMEOUT_S = 180
+
+ARTICLE_FETCH_TIMEOUT_S = 15
+ARTICLE_MAX_CHARS = 4000
+USER_AGENT = "Mozilla/5.0 (compatible; BiotechDigestBot/1.0; +https://github.com/)"
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-def clean_text(raw: str, max_len: int = 1200) -> str:
-    text = re.sub(r"<[^>]+>", "", raw or "")
-    text = re.sub(r"\s+", " ", text).strip()
-    if max_len and len(text) > max_len:
-        text = text[:max_len].rstrip() + "..."
-    return text
+def strip_html(raw: str) -> str:
+    text = re.sub(r"<(script|style|nav|aside|footer|header)[^>]*>.*?</\1>",
+                  " ", raw or "", flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&[a-z]+;", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def classify(text: str, patterns: dict, default: str) -> list[str]:
@@ -116,7 +121,44 @@ def watchlist_hits(text: str) -> list[str]:
             if any(a.lower() in text for a in aliases)]
 
 
-# ─── FETCH ───────────────────────────────────────────────────────────────────
+# ─── ARTICLE BODY FETCHING ───────────────────────────────────────────────────
+
+def fetch_article_body(url: str) -> str:
+    """Best-effort full-article fetch. Returns empty string on failure."""
+    if not url:
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=ARTICLE_FETCH_TIMEOUT_S) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            html = resp.read(500_000).decode(charset, errors="ignore")
+    except Exception:
+        return ""
+
+    # Prefer <article> > <main> > full body
+    for tag in ("article", "main"):
+        m = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", html, re.S | re.I)
+        if m:
+            html = m.group(1)
+            break
+
+    text = strip_html(html)
+    return text[:ARTICLE_MAX_CHARS]
+
+
+# ─── RSS FETCH ───────────────────────────────────────────────────────────────
+
+def extract_rss_body(entry: dict) -> str:
+    """Pull the longest text representation feedparser gives us."""
+    parts: list[str] = []
+    for c in entry.get("content", []) or []:
+        if isinstance(c, dict) and c.get("value"):
+            parts.append(c["value"])
+    if entry.get("summary"):
+        parts.append(entry["summary"])
+    parts.sort(key=len, reverse=True)
+    return strip_html(parts[0]) if parts else ""
+
 
 def fetch_feed(name: str, url: str, since: datetime) -> list[dict]:
     feed = feedparser.parse(url)
@@ -130,20 +172,24 @@ def fetch_feed(name: str, url: str, since: datetime) -> list[dict]:
             continue
 
         title = e.get("title", "").strip()
-        summary_raw = clean_text(e.get("summary", ""))
-        full_text = title + " " + summary_raw
+        rss_body = extract_rss_body(e)
+        link = e.get("link", "")
+        full_text = title + " " + rss_body
 
         out.append({
             "source": name,
             "title": title,
-            "link": e.get("link", ""),
-            "summary_raw": summary_raw,
-            "summary_en": "",
-            "summary_ko": "",
+            "link": link,
+            "rss_body": rss_body,
+            "article_body": "",
             "published": pub_dt,
             "deals": classify(full_text, DEAL_PATTERNS, "📰 General"),
             "modalities": classify(full_text, MODALITY_PATTERNS, "🔬 Other"),
             "watchlist": watchlist_hits(full_text),
+            # LLM-filled fields
+            "headline_en": "", "headline_ko": "",
+            "facts_en": [], "facts_ko": [],
+            "so_what_en": "", "so_what_ko": "",
         })
     return out
 
@@ -169,17 +215,54 @@ def collect_entries(hours: int) -> list[dict]:
     return unique
 
 
+def hydrate_article_bodies(entries: list[dict]) -> None:
+    if not entries:
+        return
+    print(f"\nFetching article bodies for {len(entries)} entries...")
+    fetched = 0
+    for e in entries:
+        if len(e["rss_body"]) >= 800:
+            continue  # RSS already has substantial content
+        body = fetch_article_body(e["link"])
+        if body and len(body) > len(e["rss_body"]):
+            e["article_body"] = body
+            fetched += 1
+    print(f"  ✓ Hydrated {fetched}/{len(entries)} entries with full article text")
+
+
+def best_content(e: dict) -> str:
+    return e["article_body"] or e["rss_body"]
+
+
 # ─── LLM ENRICHMENT ──────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = (
-    "You are a biotech VC news editor. For each news item, produce two summaries:\n"
-    "- 'en': 2-3 informative sentences in English. Mention concrete facts: company "
-    "name, deal value (if any), drug/target/modality, trial phase, indication, key "
-    "numbers. No fluff or marketing language. Do not just restate the title.\n"
-    "- 'ko': natural Korean translation of the same content. Use industry terminology "
-    "(e.g., 임상 2상, FDA 승인, 시리즈 B). Keep company and drug names in English.\n"
-    'Return strictly valid JSON: {"items":[{"i":1,"en":"...","ko":"..."}, ...]}.'
-)
+SYSTEM_PROMPT = """\
+You are a biotech VC analyst writing a daily intelligence brief. For each news \
+item, produce structured English + Korean output that lets a reader understand \
+what happened WITHOUT clicking through.
+
+For every item, return:
+- "headline_en" / "headline_ko": one tight sentence (<=20 words / <=30자) that \
+captures who did what. Better than the original title.
+- "facts_en" / "facts_ko": 3-5 bullet strings, each a single concrete fact. \
+Include where applicable: company, deal value ($M/$B), drug/program name, \
+target/mechanism, indication, trial phase + key numbers (n=, ORR%, p-value, \
+hazard ratio), regulatory milestone, partner/investor, geography, dates. \
+NO marketing language. NO filler. Each bullet is a standalone fact a VC could \
+quote in a meeting.
+- "so_what_en" / "so_what_ko": one sentence on competitive/market significance \
+— why a generalist VC should care. Mention competitors, comparable deals, or \
+market context if relevant. Avoid hype.
+
+Korean rules: use industry terms (임상 2상, 시리즈 B, FDA 승인, 1차 평가지표 \
+충족, 마일스톤). Keep all company names, drug names, and gene/protein \
+identifiers in English. Don't romanize.
+
+If a field is genuinely unknown from the source, write "N/A" — do not invent.
+
+Return STRICT JSON: {"items":[{"i":1,"headline_en":"...","headline_ko":"...",\
+"facts_en":["..."],"facts_ko":["..."],"so_what_en":"...","so_what_ko":"..."}]}\
+"""
 
 
 def call_llm(messages: list[dict]) -> str | None:
@@ -189,12 +272,11 @@ def call_llm(messages: list[dict]) -> str | None:
     body = json.dumps({
         "model": LLM_MODEL,
         "messages": messages,
-        "temperature": 0.3,
+        "temperature": 0.2,
         "response_format": {"type": "json_object"},
     }).encode("utf-8")
     req = urllib.request.Request(
-        LLM_ENDPOINT,
-        data=body,
+        LLM_ENDPOINT, data=body,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -214,12 +296,15 @@ def call_llm(messages: list[dict]) -> str | None:
 
 def enrich_batch(entries: list[dict]) -> bool:
     items_text = "\n\n".join(
-        f"{i+1}. TITLE: {e['title']}\n   CONTENT: {e['summary_raw']}"
+        f"=== ITEM {i+1} ===\n"
+        f"SOURCE: {e['source']}\n"
+        f"TITLE: {e['title']}\n"
+        f"BODY: {best_content(e)[:3500]}"
         for i, e in enumerate(entries)
     )
     raw = call_llm([
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Items:\n{items_text}"},
+        {"role": "user", "content": items_text},
     ])
     if not raw:
         return False
@@ -230,9 +315,15 @@ def enrich_batch(entries: list[dict]) -> bool:
         return False
     for item in parsed.get("items", []):
         idx = item.get("i", 0) - 1
-        if 0 <= idx < len(entries):
-            entries[idx]["summary_en"] = item.get("en", "").strip()
-            entries[idx]["summary_ko"] = item.get("ko", "").strip()
+        if not (0 <= idx < len(entries)):
+            continue
+        e = entries[idx]
+        e["headline_en"] = (item.get("headline_en") or "").strip()
+        e["headline_ko"] = (item.get("headline_ko") or "").strip()
+        e["facts_en"] = [str(f).strip() for f in (item.get("facts_en") or []) if f]
+        e["facts_ko"] = [str(f).strip() for f in (item.get("facts_ko") or []) if f]
+        e["so_what_en"] = (item.get("so_what_en") or "").strip()
+        e["so_what_ko"] = (item.get("so_what_ko") or "").strip()
     return True
 
 
@@ -240,7 +331,7 @@ def enrich_with_llm(entries: list[dict]) -> None:
     if not entries:
         return
     if not os.environ.get("GITHUB_TOKEN"):
-        print("\n  (no GITHUB_TOKEN — skipping LLM, using raw RSS summaries)")
+        print("\n  (no GITHUB_TOKEN — skipping LLM, will render raw RSS bodies)")
         return
     print(f"\nEnriching {len(entries)} entries via GitHub Models ({LLM_MODEL})...")
     for start in range(0, len(entries), LLM_BATCH_SIZE):
@@ -254,20 +345,20 @@ def enrich_with_llm(entries: list[dict]) -> None:
 
 LABELS = {
     "en": {
-        "title_prefix": "🧬 Biotech Daily Digest",
+        "title": "🧬 Biotech Daily Digest",
         "meta": lambda h, n, s: f"*Last {h}h · {n} unique entries · {s} sources*",
         "at_a_glance": "📊 At a Glance",
-        "modality_col": "Modality",
-        "total_col": "Total",
+        "modality_col": "Modality", "total_col": "Total",
         "watchlist": "🎯 Watchlist Hits",
+        "so_what": "**So what:**",
     },
     "ko": {
-        "title_prefix": "🧬 바이오테크 데일리 다이제스트",
+        "title": "🧬 바이오테크 데일리 다이제스트",
         "meta": lambda h, n, s: f"*최근 {h}시간 · 고유 기사 {n}건 · 소스 {s}개*",
         "at_a_glance": "📊 한눈에 보기",
-        "modality_col": "모달리티",
-        "total_col": "합계",
+        "modality_col": "모달리티", "total_col": "합계",
         "watchlist": "🎯 워치리스트 매치",
+        "so_what": "**시사점:**",
     },
 }
 
@@ -282,7 +373,7 @@ def build_summary_table(entries: list[dict], lang: str) -> str:
                 counts[m][d] = counts[m].get(d, 0) + 1
     if not counts:
         return ""
-    deal_cols = [d for d in DEAL_ORDER if any(d in row for row in counts.values())]
+    deal_cols = [d for d in DEAL_ORDER if any(d in r for r in counts.values())]
     header = f"| {L['modality_col']} | {L['total_col']} | " + " | ".join(deal_cols) + " |"
     sep = "|" + "---|" * (len(deal_cols) + 2)
     rows = []
@@ -296,16 +387,33 @@ def build_summary_table(entries: list[dict], lang: str) -> str:
     return "\n".join([f"## {L['at_a_glance']}", "", header, sep, *rows, ""])
 
 
+def render_entry(e: dict, lang: str) -> list[str]:
+    L = LABELS[lang]
+    headline = e[f"headline_{lang}"] or e["title"]
+    facts = e[f"facts_{lang}"]
+    so_what = e[f"so_what_{lang}"]
+    deal_tags = " ".join(f"`{d}`" for d in e["deals"])
+    mod_tags = " ".join(f"`{m}`" for m in e["modalities"])
+
+    lines = [
+        f"### [{headline}]({e['link']})",
+        f"{deal_tags} {mod_tags} *— {e['source']}*",
+        "",
+    ]
+    if facts:
+        lines += [f"- {f}" for f in facts] + [""]
+    elif e["rss_body"]:  # fallback when LLM missing
+        lines += [f"> {e['rss_body'][:500]}", ""]
+    if so_what and so_what.upper() != "N/A":
+        lines += [f"{L['so_what']} {so_what}", ""]
+    return lines
+
+
 def render_digest(entries: list[dict], lang: str, hours: int) -> str:
     L = LABELS[lang]
     today = datetime.now().strftime("%Y-%m-%d (%A)")
-    sum_field = "summary_en" if lang == "en" else "summary_ko"
-
-    def get_summary(e: dict) -> str:
-        return e.get(sum_field) or e.get("summary_raw") or ""
-
     lines = [
-        f"# {L['title_prefix']} — {today}",
+        f"# {L['title']} — {today}",
         "",
         L["meta"](hours, len(entries), len(FEEDS)),
         "",
@@ -317,12 +425,7 @@ def render_digest(entries: list[dict], lang: str, hours: int) -> str:
         lines += [f"## {L['watchlist']}", ""]
         for e in wl:
             tags = ", ".join(f"**{c}**" for c in e["watchlist"])
-            deal_tags = " ".join(f"`{d}`" for d in e["deals"])
-            lines += [
-                f"- {tags} {deal_tags} — [{e['title']}]({e['link']}) *— {e['source']}*",
-                f"  > {get_summary(e)}",
-                "",
-            ]
+            lines += [f"> {tags}", ""] + render_entry(e, lang)
 
     by_mod: dict[str, list[dict]] = {}
     for e in entries:
@@ -335,12 +438,7 @@ def render_digest(entries: list[dict], lang: str, hours: int) -> str:
         items = by_mod[mod]
         lines += [f"## {mod} ({len(items)})", ""]
         for e in items[:20]:
-            deal_tags = " ".join(f"`{d}`" for d in e["deals"])
-            lines += [
-                f"- {deal_tags} [{e['title']}]({e['link']}) *— {e['source']}*",
-                f"  {get_summary(e)}",
-                "",
-            ]
+            lines += render_entry(e, lang)
     return "\n".join(lines)
 
 
@@ -350,9 +448,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hours", type=int, default=24)
     parser.add_argument("--out", type=Path, default=Path("digests"))
+    parser.add_argument("--no-fetch", action="store_true",
+                        help="Skip article body fetching (use RSS only)")
     args = parser.parse_args()
 
     entries = collect_entries(args.hours)
+    if not args.no_fetch:
+        hydrate_article_bodies(entries)
     enrich_with_llm(entries)
 
     args.out.mkdir(exist_ok=True)
